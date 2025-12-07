@@ -1,0 +1,407 @@
+// neon_snake.c
+// Simple Snake game in C using SDL2
+// Controls:
+//   Arrow keys = move
+//   SPACE      = start
+//   P          = pause / resume
+//   M          = toggle wrap (ON/OFF)
+//   R          = reset
+//
+// Compile example (Linux):
+//   gcc neon_snake.c -o neon_snake `sdl2-config --cflags --libs`
+//
+// Compile example (Windows + MinGW, with SDL2 installed):
+//   gcc neon_snake.c -o neon_snake -IC:/SDL2/include -LC:/SDL2/lib -lSDL2
+
+#include <SDL2/SDL.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+// ----- Configuration -----
+#define COLS 32
+#define ROWS 24
+#define CELL_SIZE 24            // pixels per cell
+#define INITIAL_LENGTH 4
+#define BASE_SPEED 10.0f        // moves per second
+#define SPEED_INCREASE 1.25f
+#define SCORE_PER_FOOD 10
+#define LEVEL_STEP_SCORE 50     // level up every 50 points
+
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+typedef struct {
+    Point segments[COLS * ROWS];
+    int length;
+    int dx;
+    int dy;
+} Snake;
+
+typedef struct {
+    bool running;
+    bool paused;
+    bool wrap;
+    int score;
+    int level;
+    float speed;          // moves per second
+    Uint32 lastStepTime;  // last movement time (ms)
+    Uint32 stepInterval;  // ms between moves
+} GameState;
+
+// ----- Globals -----
+Snake snake;
+Point apple;
+GameState game;
+SDL_Window *window = NULL;
+SDL_Renderer *renderer = NULL;
+
+// ----- Utility -----
+int randRange(int min, int max) {
+    return min + rand() % (max - min + 1);
+}
+
+bool positionsEqual(Point a, Point b) {
+    return a.x == b.x && a.y == b.y;
+}
+
+// Check if snake occupies a given cell
+bool snakeOccupies(int x, int y) {
+    for (int i = 0; i < snake.length; i++) {
+        if (snake.segments[i].x == x && snake.segments[i].y == y)
+            return true;
+    }
+    return false;
+}
+
+// Place apple at random empty cell
+void spawnApple(void) {
+    int x, y;
+    do {
+        x = randRange(0, COLS - 1);
+        y = randRange(0, ROWS - 1);
+    } while (snakeOccupies(x, y));
+    apple.x = x;
+    apple.y = y;
+}
+
+// Reset snake in center
+void resetSnake(void) {
+    snake.length = INITIAL_LENGTH;
+    snake.dx = 1;
+    snake.dy = 0;
+
+    int startX = COLS / 2;
+    int startY = ROWS / 2;
+    for (int i = 0; i < snake.length; i++) {
+        snake.segments[i].x = startX - i;
+        snake.segments[i].y = startY;
+    }
+}
+
+// Reset full game
+void resetGame(void) {
+    resetSnake();
+    spawnApple();
+    game.running = false;
+    game.paused = false;
+    game.wrap = false;
+    game.score = 0;
+    game.level = 1;
+    game.speed = BASE_SPEED;
+    game.stepInterval = (Uint32)(1000.0f / game.speed);
+    game.lastStepTime = SDL_GetTicks();
+
+    SDL_SetWindowTitle(window, "Neon Snake - Score: 0  Level: 1");
+}
+
+// Update window title with score + level + wrap
+void updateWindowTitle(void) {
+    char title[128];
+    snprintf(title, sizeof(title),
+             "Neon Snake - Score: %d  Level: %d  Wrap: %s",
+             game.score, game.level, game.wrap ? "ON" : "OFF");
+    SDL_SetWindowTitle(window, title);
+}
+
+// ----- Logic -----
+
+// Handle one step of snake movement
+void stepSnake(void) {
+    if (!game.running || game.paused) return;
+
+    Point head = snake.segments[0];
+    int nx = head.x + snake.dx;
+    int ny = head.y + snake.dy;
+
+    if (game.wrap) {
+        if (nx < 0) nx = COLS - 1;
+        if (nx >= COLS) nx = 0;
+        if (ny < 0) ny = ROWS - 1;
+        if (ny >= ROWS) ny = 0;
+    } else {
+        if (nx < 0 || nx >= COLS || ny < 0 || ny >= ROWS) {
+            // Game over
+            game.running = false;
+            game.paused = false;
+            return;
+        }
+    }
+
+    // Check self-collision
+    for (int i = 0; i < snake.length; i++) {
+        if (snake.segments[i].x == nx && snake.segments[i].y == ny) {
+            game.running = false;
+            game.paused = false;
+            return;
+        }
+    }
+
+    // Shift body from tail to head
+    for (int i = snake.length; i > 0; i--) {
+        snake.segments[i] = snake.segments[i - 1];
+    }
+    snake.segments[0].x = nx;
+    snake.segments[0].y = ny;
+
+    bool ateApple = (nx == apple.x && ny == apple.y);
+
+    if (ateApple) {
+        snake.length++;
+        if (snake.length > COLS * ROWS) {
+            snake.length = COLS * ROWS;
+        }
+
+        game.score += SCORE_PER_FOOD;
+        int newLevel = (game.score / LEVEL_STEP_SCORE) + 1;
+        if (newLevel > game.level) {
+            game.level = newLevel;
+            game.speed *= SPEED_INCREASE;
+            if (game.speed > 60.0f) game.speed = 60.0f;
+            game.stepInterval = (Uint32)(1000.0f / game.speed);
+        }
+
+        spawnApple();
+        updateWindowTitle();
+    } else {
+        // No growth – last element is now unused (snake.length unchanged)
+        // because we shifted from [length] down to 1, we still have length+1
+        // but we only consider indexes [0..length-1].
+    }
+}
+
+// Prevent direct reversal of direction
+void setDirection(int dx, int dy) {
+    if (!game.running) {
+        game.running = true;
+        game.paused = false;
+        game.lastStepTime = SDL_GetTicks();
+    }
+
+    if (snake.length > 1) {
+        // Current direction
+        if (dx == -snake.dx && dy == -snake.dy) {
+            return; // ignore reverse
+        }
+    }
+    snake.dx = dx;
+    snake.dy = dy;
+}
+
+// ----- Rendering -----
+void renderGrid(void) {
+    // Light neon grid lines on dark background
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, 0, 20, 10, 255);
+    SDL_RenderClear(renderer);
+
+    SDL_SetRenderDrawColor(renderer, 0, 255, 140, 25); // faint neon lines
+    for (int x = 0; x <= COLS; x++) {
+        int px = x * CELL_SIZE;
+        SDL_RenderDrawLine(renderer, px, 0, px, ROWS * CELL_SIZE);
+    }
+    for (int y = 0; y <= ROWS; y++) {
+        int py = y * CELL_SIZE;
+        SDL_RenderDrawLine(renderer, 0, py, COLS * CELL_SIZE, py);
+    }
+}
+
+// Draw snake as bright green blocks
+void renderSnake(void) {
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+    for (int i = snake.length - 1; i >= 0; i--) {
+        int x = snake.segments[i].x * CELL_SIZE;
+        int y = snake.segments[i].y * CELL_SIZE;
+
+        // Outer glow-ish rect
+        SDL_Rect outer = { x + 2, y + 2, CELL_SIZE - 4, CELL_SIZE - 4 };
+        Uint8 alphaOuter = (Uint8)(70 + (float)(snake.length - i) / snake.length * 80);
+        SDL_SetRenderDrawColor(renderer, 0, 255, 140, alphaOuter);
+        SDL_RenderFillRect(renderer, &outer);
+
+        // Inner core
+        SDL_Rect inner = { x + 5, y + 5, CELL_SIZE - 10, CELL_SIZE - 10 };
+        Uint8 alphaInner = (Uint8)(120 + (float)(snake.length - i) / snake.length * 120);
+        SDL_SetRenderDrawColor(renderer, 0, 240, 160, alphaInner);
+        SDL_RenderFillRect(renderer, &inner);
+    }
+
+    // Head highlight
+    SDL_Rect headRect = {
+        snake.segments[0].x * CELL_SIZE + 4,
+        snake.segments[0].y * CELL_SIZE + 4,
+        CELL_SIZE - 8,
+        CELL_SIZE - 8
+    };
+    SDL_SetRenderDrawColor(renderer, 190, 255, 220, 255);
+    SDL_RenderDrawRect(renderer, &headRect);
+}
+
+// Draw red apple
+void renderApple(void) {
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+    int x = apple.x * CELL_SIZE;
+    int y = apple.y * CELL_SIZE;
+
+    SDL_Rect body = { x + 4, y + 4, CELL_SIZE - 8, CELL_SIZE - 8 };
+    SDL_SetRenderDrawColor(renderer, 255, 60, 60, 255);
+    SDL_RenderFillRect(renderer, &body);
+
+    // highlight
+    SDL_Rect shine = { x + 6, y + 6, (CELL_SIZE - 8) / 2, (CELL_SIZE - 8) / 2 };
+    SDL_SetRenderDrawColor(renderer, 255, 200, 200, 180);
+    SDL_RenderFillRect(renderer, &shine);
+}
+
+// Render everything
+void render(void) {
+    renderGrid();
+    renderApple();
+    renderSnake();
+
+    // Optional: overlay when paused or stopped
+    if (!game.running || game.paused) {
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 120);
+        SDL_Rect overlay = { 0, 0, COLS * CELL_SIZE, ROWS * CELL_SIZE };
+        SDL_RenderFillRect(renderer, &overlay);
+        // (No text, but window title & controls are documented.)
+    }
+
+    SDL_RenderPresent(renderer);
+}
+
+// ----- Main -----
+int main(int argc, char *argv[]) {
+    (void)argc;
+    (void)argv;
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+        fprintf(stderr, "SDL_Init error: %s\n", SDL_GetError());
+        return 1;
+    }
+
+    srand((unsigned int)time(NULL));
+
+    int winWidth = COLS * CELL_SIZE;
+    int winHeight = ROWS * CELL_SIZE;
+
+    window = SDL_CreateWindow(
+        "Neon Snake",
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        winWidth, winHeight,
+        SDL_WINDOW_SHOWN
+    );
+    if (!window) {
+        fprintf(stderr, "SDL_CreateWindow error: %s\n", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!renderer) {
+        fprintf(stderr, "SDL_CreateRenderer error: %s\n", SDL_GetError());
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+
+    resetGame();
+    updateWindowTitle();
+
+    bool quit = false;
+    while (!quit) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) {
+                quit = true;
+            } else if (e.type == SDL_KEYDOWN) {
+                SDL_Keycode key = e.key.keysym.sym;
+                switch (key) {
+                    case SDLK_ESCAPE:
+                        quit = true;
+                        break;
+                    case SDLK_UP:
+                        setDirection(0, -1);
+                        break;
+                    case SDLK_DOWN:
+                        setDirection(0, 1);
+                        break;
+                    case SDLK_LEFT:
+                        setDirection(-1, 0);
+                        break;
+                    case SDLK_RIGHT:
+                        setDirection(1, 0);
+                        break;
+                    case SDLK_SPACE:
+                        if (!game.running) {
+                            game.running = true;
+                            game.paused = false;
+                            game.lastStepTime = SDL_GetTicks();
+                        }
+                        break;
+                    case SDLK_p:
+                    case SDLK_P:
+                        if (game.running) {
+                            game.paused = !game.paused;
+                        }
+                        break;
+                    case SDLK_m:
+                    case SDLK_M:
+                        game.wrap = !game.wrap;
+                        updateWindowTitle();
+                        break;
+                    case SDLK_r:
+                    case SDLK_R:
+                        resetGame();
+                        updateWindowTitle();
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        Uint32 now = SDL_GetTicks();
+        if (game.running && !game.paused && (now - game.lastStepTime) >= game.stepInterval) {
+            game.lastStepTime = now;
+            stepSnake();
+            if (!game.running) {
+                // Game over: overlay handled by render();
+            }
+        }
+
+        render();
+        SDL_Delay(5); // small delay to avoid 100% CPU
+    }
+
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 0;
+}
